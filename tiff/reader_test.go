@@ -12,6 +12,7 @@ import (
 	"image"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -408,6 +409,198 @@ func TestLargeIFDEntry(t *testing.T) {
 	_, err := Decode(strings.NewReader(testdata))
 	if err == nil {
 		t.Fatal("Decode with large IFD entry: got nil error, want non-nil")
+	}
+}
+
+// countingReaderAt wraps a byte slice and records the largest single ReadAt
+// request made of it, so that a test can check that a bogus length taken from a
+// TIFF file does not lead to an unbounded allocation before the (necessarily
+// failing) read of that data.
+type countingReaderAt struct {
+	r          *bytes.Reader
+	maxReadLen int
+}
+
+func (c *countingReaderAt) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) > c.maxReadLen {
+		c.maxReadLen = len(p)
+	}
+	return c.r.ReadAt(p, off)
+}
+
+// rampReaderAt is an io.ReaderAt that behaves like an arbitrarily long stream
+// in which the byte at offset i has the value byte(i), without allocating it.
+type rampReaderAt struct{}
+
+func (rampReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	for i := range p {
+		p[i] = byte(off + int64(i))
+	}
+	return len(p), nil
+}
+
+// ifdEntryOffset returns the offset, within the little-endian TIFF file b, of
+// the IFD entry with the given tag.
+func ifdEntryOffset(t *testing.T, b []byte, tag int) int {
+	t.Helper()
+	ifdOffset := int(binary.LittleEndian.Uint32(b[4:8]))
+	numItems := int(binary.LittleEndian.Uint16(b[ifdOffset:]))
+	for i := 0; i < numItems; i++ {
+		off := ifdOffset + 2 + i*ifdLen
+		if int(binary.LittleEndian.Uint16(b[off:])) == tag {
+			return off
+		}
+	}
+	t.Fatalf("could not find the IFD entry with tag %d", tag)
+	return 0
+}
+
+// TestSafeReadAt tests that safeReadAt does not allocate a buffer of an
+// untrusted size up front, and that reading in chunks still yields the same
+// bytes as a single read would.
+func TestSafeReadAt(t *testing.T) {
+	const data = "0123456789"
+	r := strings.NewReader(data)
+
+	// A length that cannot be represented as an int is a read failure, not an
+	// enormous allocation.
+	if _, err := safeReadAt(r, uint64(math.MaxUint64), 0); err != io.ErrUnexpectedEOF {
+		t.Errorf("safeReadAt with an unrepresentable length: got %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+
+	// Reading no bytes at the very end of the input is not an error.
+	if buf, err := safeReadAt(r, 0, int64(len(data))); err != nil || len(buf) != 0 {
+		t.Errorf("safeReadAt of 0 bytes: got %q, %v, want an empty buffer and a nil error", buf, err)
+	}
+
+	// Reading more than the 10 bytes the input holds is an error.
+	if _, err := safeReadAt(r, 11, 0); err == nil {
+		t.Error("safeReadAt past the end of the input: got a nil error, want non-nil")
+	}
+
+	// A read that fits is served in one go.
+	if buf, err := safeReadAt(r, 4, 2); err != nil || string(buf) != "2345" {
+		t.Errorf("safeReadAt of 4 bytes: got %q, %v, want %q and a nil error", buf, err, "2345")
+	}
+
+	// A read of more than maxChunkSize bytes is served in chunks, and the
+	// result is the concatenation of those chunks.
+	const n = maxChunkSize + 5
+	buf, err := safeReadAt(rampReaderAt{}, n, 0)
+	if err != nil {
+		t.Fatalf("safeReadAt of %d bytes: %v", n, err)
+	}
+	if len(buf) != n {
+		t.Fatalf("safeReadAt of %d bytes: got %d bytes", n, len(buf))
+	}
+	for i := range buf {
+		if buf[i] != byte(i) {
+			t.Fatalf("safeReadAt of %d bytes: byte %d is %d, want %d", n, i, buf[i], byte(i))
+		}
+	}
+
+	// A chunked read that runs out of data is an error, and no more than
+	// maxChunkSize bytes are read at a time on the way to finding that out.
+	c := &countingReaderAt{r: bytes.NewReader([]byte(data))}
+	if _, err := safeReadAt(c, n, 0); err == nil {
+		t.Error("safeReadAt of a huge length from a short input: got a nil error, want non-nil")
+	}
+	if c.maxReadLen > maxChunkSize {
+		t.Errorf("safeReadAt read %d bytes at once, want at most %d", c.maxReadLen, maxChunkSize)
+	}
+}
+
+// TestDecodeHugeIFDValueLength tests that an IFD entry that points at an
+// enormous amount of data is rejected without first allocating a buffer of
+// that size.
+func TestDecodeHugeIFDValueLength(t *testing.T) {
+	// count is the largest number of dtLong values that gets past the "IFD data
+	// too large" check in ifdUint, which is math.MaxInt32 / 4. The data is
+	// therefore just under 2 GiB long and, being longer than 4 bytes, is
+	// pointed at by the entry instead of being held inside it.
+	const count = math.MaxInt32 / 4
+
+	// 8 header bytes, 2 for the entry count, 12 for the one entry and 4 for the
+	// offset of the next IFD.
+	b := make([]byte, 8+2+ifdLen+4)
+	copy(b, leHeader)
+	// Offset of the first IFD.
+	binary.LittleEndian.PutUint32(b[4:], 8)
+	// Number of IFD entries.
+	binary.LittleEndian.PutUint16(b[8:], 1)
+	// The entry itself: tag, data type, number of values and their offset.
+	binary.LittleEndian.PutUint16(b[10:], tStripByteCounts)
+	binary.LittleEndian.PutUint16(b[12:], dtLong)
+	binary.LittleEndian.PutUint32(b[14:], count)
+	binary.LittleEndian.PutUint32(b[18:], 0)
+
+	c := &countingReaderAt{r: bytes.NewReader(b)}
+	if _, err := Decode(c); err == nil {
+		t.Fatal("got a nil error, want non-nil")
+	}
+	if c.maxReadLen > maxChunkSize {
+		t.Errorf("decoding read %d bytes at once, want at most %d", c.maxReadLen, maxChunkSize)
+	}
+}
+
+// TestDecodeHugeStripByteCount tests that a StripByteCounts value that is far
+// larger than the pixel data actually present is rejected without first
+// allocating a buffer of that size.
+func TestDecodeHugeStripByteCount(t *testing.T) {
+	var w bytes.Buffer
+	if err := Encode(&w, image.NewRGBA(image.Rect(0, 0, 4, 4)), nil); err != nil {
+		t.Fatal(err)
+	}
+	b := w.Bytes()
+
+	// Claim that the uncompressed pixel data is almost 4 GiB long. The entry
+	// holds a single dtLong value, which is 4 bytes, so the value is stored
+	// inside the entry rather than being pointed at.
+	off := ifdEntryOffset(t, b, tStripByteCounts)
+	if v := binary.LittleEndian.Uint16(b[off+2:]); v != dtLong {
+		t.Fatalf("StripByteCounts has data type %d, want %d", v, dtLong)
+	}
+	if v := binary.LittleEndian.Uint32(b[off+4:]); v != 1 {
+		t.Fatalf("StripByteCounts holds %d values, want 1", v)
+	}
+	binary.LittleEndian.PutUint32(b[off+8:], math.MaxUint32)
+
+	// The reader deliberately implements io.ReaderAt, so that it is used as is
+	// instead of being wrapped in a *buffer. Decode then reads the pixel data
+	// with the StripByteCounts value instead of slicing the buffer.
+	c := &countingReaderAt{r: bytes.NewReader(b)}
+	if _, err := Decode(c); err == nil {
+		t.Fatal("got a nil error, want non-nil")
+	}
+	if c.maxReadLen > maxChunkSize {
+		t.Errorf("decoding read %d bytes at once, want at most %d", c.maxReadLen, maxChunkSize)
+	}
+}
+
+// TestDecodeShortIFD tests that an IFD header claiming far more entries than
+// the file holds is rejected instead of yielding those entries as pixel data.
+// The claimed number of entries is a uint16, so ifdLen times it always fits in
+// one chunk, but the read of the entries must still fail rather than succeed
+// against a truncated file.
+func TestDecodeShortIFD(t *testing.T) {
+	// 8 header bytes and 2 for the entry count, with no entries at all.
+	b := make([]byte, 10)
+	copy(b, leHeader)
+	// Offset of the first IFD.
+	binary.LittleEndian.PutUint32(b[4:], 8)
+	// Number of IFD entries.
+	binary.LittleEndian.PutUint16(b[8:], math.MaxUint16)
+
+	c := &countingReaderAt{r: bytes.NewReader(b)}
+	if _, err := Decode(c); err == nil {
+		t.Fatal("got a nil error, want non-nil")
+	}
+	if c.maxReadLen > maxChunkSize {
+		t.Errorf("decoding read %d bytes at once, want at most %d", c.maxReadLen, maxChunkSize)
 	}
 }
 
