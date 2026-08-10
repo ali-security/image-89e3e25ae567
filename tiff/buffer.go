@@ -4,7 +4,10 @@
 
 package tiff
 
-import "io"
+import (
+	"fmt"
+	"io"
+)
 
 // buffer buffers an io.Reader to satisfy io.ReaderAt.
 type buffer struct {
@@ -13,6 +16,10 @@ type buffer struct {
 }
 
 const fillChunkSize = 10 << 20 // 10 MB
+
+// maxInt is the largest value of type int.
+// It is equivalent to math.MaxInt, which is not available in this Go version.
+const maxInt = int(^uint(0) >> 1)
 
 // grow grows the capacity of b, if necessary, to guarantee space for another
 // n bytes, and returns the resulting slice with an unchanged length.
@@ -42,22 +49,34 @@ func (b *buffer) fill(end int) error {
 }
 
 func (b *buffer) ReadAt(p []byte, off int64) (int, error) {
-	o := int(off)
-	end := o + len(p)
-	if int64(end) != off+int64(len(p)) {
+	if off < 0 {
+		// Impossible in correct usage, but check for safety.
+		return 0, fmt.Errorf("invalid ReadAt offset %v (bug)", off)
+	}
+	end64 := off + int64(len(p))
+	if end64 < off || end64 > int64(maxInt) {
 		return 0, io.ErrUnexpectedEOF
 	}
+	end := int(end64)
 
 	err := b.fill(end)
 	end = minInt(end, len(b.buf))
-	return copy(p, b.buf[minInt(o, end):end]), err
+	return copy(p, b.buf[minInt(int(off), end):end]), err
 }
 
 // Slice returns a slice of the underlying buffer. The slice contains
 // n bytes starting at offset off.
-func (b *buffer) Slice(off, n int) ([]byte, error) {
+func (b *buffer) Slice(off, n int64) ([]byte, error) {
+	if off < 0 || n < 0 {
+		// Impossible in correct usage, but check for safety.
+		return nil, fmt.Errorf("invalid negative input to Slice(%v, %v) (bug)", off, n)
+	}
 	end := off + n
-	if err := b.fill(end); err != nil {
+	if end < 0 || end > int64(maxInt) {
+		// end is too large. Treat this as a read error.
+		return nil, io.ErrUnexpectedEOF
+	}
+	if err := b.fill(int(end)); err != nil {
 		return nil, err
 	}
 	return b.buf[off:end], nil

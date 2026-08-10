@@ -1079,3 +1079,112 @@ func TestDecodeOOMIFDOffset(t *testing.T) {
 		})
 	}
 }
+
+// TestDecodeSliceOverflow tests that decoding a TIFF with a large strip offset
+// does not trigger a slice bounds panic in buffer.Slice.
+func TestDecodeSliceOverflow(t *testing.T) {
+	var tiffHeader = []byte{
+		'I', 'I', 42, 0, // Header
+		8, 0, 0, 0, // Offset of first IFD
+		4, 0, // Number of IFD entries (4)
+		// Entry 1: ImageWidth (256)
+		0, 1, // Tag 256
+		3, 0, // dtShort (3)
+		1, 0, 0, 0, // Count 1
+		1, 0, 0, 0, // Value: 1
+		// Entry 2: ImageLength (257)
+		1, 1, // Tag 257
+		3, 0, // dtShort (3)
+		1, 0, 0, 0, // Count 1
+		1, 0, 0, 0, // Value: 1
+		// Entry 3: StripOffsets (273)
+		0x11, 0x01, // Tag 273
+		4, 0, // dtLong (4)
+		1, 0, 0, 0, // Count 1
+		0xff, 0xff, 0xff, 0xff, // Value: 0xFFFFFFFF
+		// Entry 4: StripByteCounts (279)
+		0x17, 0x01, // Tag 279
+		4, 0, // dtLong (4)
+		1, 0, 0, 0, // Count 1
+		10, 0, 0, 0, // Value: 10
+		0, 0, 0, 0, // Next IFD offset
+	}
+
+	// Use ioReader to force the use of the buffer code path.
+	r := &ioReader{Reader: bytes.NewReader(tiffHeader)}
+	_, err := Decode(r)
+	if err == nil {
+		t.Error("Decode: got nil error, want non-nil")
+	}
+}
+
+// newTestBuffer returns a *buffer reading from a ramp of n bytes, which is the
+// code path that Decode uses for a plain io.Reader.
+func newTestBuffer(n int) *buffer {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	return &buffer{
+		r:   bytes.NewReader(data),
+		buf: make([]byte, 0, 1024),
+	}
+}
+
+// TestBufferReadAtNegativeOffset tests that buffer.ReadAt rejects a negative
+// offset with an error instead of panicking on a negative slice bound. The
+// negative offset is impossible in correct usage, so this guards against a bug
+// elsewhere in the decoder turning into an out-of-bounds read.
+func TestBufferReadAtNegativeOffset(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("buffer.ReadAt with a negative offset panicked: %v", r)
+		}
+	}()
+
+	for _, off := range []int64{-1, -16, math.MinInt64} {
+		b := newTestBuffer(64)
+		p := make([]byte, 8)
+		n, err := b.ReadAt(p, off)
+		if err == nil {
+			t.Errorf("buffer.ReadAt(p, %d): got nil error, want non-nil", off)
+		}
+		if n != 0 {
+			t.Errorf("buffer.ReadAt(p, %d): read %d bytes, want 0", off, n)
+		}
+	}
+}
+
+// TestBufferSliceBadInput tests that buffer.Slice rejects negative offsets and
+// lengths, and offsets whose sum overflows the largest int, with an error
+// instead of panicking on an out-of-range slice bound.
+func TestBufferSliceBadInput(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("buffer.Slice with an invalid input panicked: %v", r)
+		}
+	}()
+
+	for _, c := range []struct {
+		off, n int64
+	}{
+		// Negative inputs.
+		{-1, 8},
+		{8, -1},
+		{-1, -1},
+		{math.MinInt64, 8},
+		// Inputs whose sum overflows.
+		{math.MaxInt64 - 4, 10},
+		{math.MaxInt64, math.MaxInt64},
+		{math.MaxInt64, 1},
+	} {
+		b := newTestBuffer(64)
+		s, err := b.Slice(c.off, c.n)
+		if err == nil {
+			t.Errorf("buffer.Slice(%d, %d): got nil error, want non-nil", c.off, c.n)
+		}
+		if s != nil {
+			t.Errorf("buffer.Slice(%d, %d): got a %d byte slice, want nil", c.off, c.n, len(s))
+		}
+	}
+}
