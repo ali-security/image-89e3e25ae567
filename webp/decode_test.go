@@ -271,6 +271,55 @@ func TestDecodePartitionTooLarge(t *testing.T) {
 	}
 }
 
+func TestVP8XImageTooLarge(t *testing.T) {
+	data := []byte{
+		// WebP file header
+		'R', 'I', 'F', 'F',
+		22, 0, 0, 0, // file size
+		'W', 'E', 'B', 'P',
+		// ChunkHeader('VP8X')
+		'V', 'P', '8', 'X',
+		10, 0, 0, 0, // chunk size
+		// bits + Reserved
+		1 << 4, 0, 0, 0, // alpha bit set
+		// Canvas Width Minus One
+		0xff, 0xff, 0x00,
+		// Canvas Height Minus One
+		0xff, 0x7f, 0x00,
+	}
+	_, err := DecodeConfig(bytes.NewReader(data))
+	if err != errInvalidFormat {
+		t.Fatalf("unexpected error: want %q, got %q", errInvalidFormat, err)
+	}
+}
+
+func TestVP8XImageNotQuiteTooLarge(t *testing.T) {
+	data := []byte{
+		// WebP file header
+		'R', 'I', 'F', 'F',
+		22, 0, 0, 0, // file size
+		'W', 'E', 'B', 'P',
+		// ChunkHeader('VP8X')
+		'V', 'P', '8', 'X',
+		10, 0, 0, 0, // chunk size
+		// bits + Reserved
+		1 << 4, 0, 0, 0, // alpha bit set
+		// Canvas Width Minus One
+		0xff, 0xff, 0x00,
+		// Canvas Height Minus One
+		0xfe, 0x7f, 0x00,
+	}
+	cfg, err := DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: want nil, got %q", err)
+	}
+	wantWidth := 0x10000
+	wantHeight := 0x7fff
+	if cfg.Width != wantWidth || cfg.Height != wantHeight {
+		t.Fatalf("width x height: got %v x %v, want %v x %v", cfg.Width, cfg.Height, wantWidth, wantHeight)
+	}
+}
+
 func benchmarkDecode(b *testing.B, filename string) {
 	data, err := ioutil.ReadFile("../testdata/blue-purple-pink-large." + filename + ".webp")
 	if err != nil {
