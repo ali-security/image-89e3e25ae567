@@ -416,6 +416,73 @@ func TestLargeIFDEntry(t *testing.T) {
 	}
 }
 
+// TestInvalidPaletteRef tests that decoding a paletted image whose pixel data
+// references a color index past the end of the ColorMap reports an error,
+// instead of returning an image whose Pix values are out of range for its
+// Palette (indexing that Palette would panic on a later At or ColorIndexAt
+// call).
+func TestInvalidPaletteRef(t *testing.T) {
+	// A minimal little-endian paletted TIFF: one 1x1 uncompressed strip with
+	// 8 BitsPerSample, so the single pixel byte is a color index in the range
+	// [0, 256), combined with a ColorMap that holds only two colors. The pixel
+	// written below indexes entry 255 of that two-entry palette. The ColorMap
+	// length and the BitsPerSample value come from independent IFD entries, so
+	// nothing else in the decoder rejects this combination.
+	const (
+		ifdOffset      = 8
+		numEntries     = 9
+		colorMapOffset = ifdOffset + 2 + numEntries*ifdLen
+		pixelOffset    = colorMapOffset + 12
+	)
+
+	b := make([]byte, pixelOffset+1)
+	copy(b, leHeader)
+	binary.LittleEndian.PutUint32(b[4:8], ifdOffset)
+	binary.LittleEndian.PutUint16(b[ifdOffset:], numEntries)
+
+	// putEntry writes one 12-byte IFD entry, either with an inline value or,
+	// when the value does not fit in four bytes, with an offset to it. Entries
+	// must be written in ascending tag order.
+	i := ifdOffset + 2
+	putEntry := func(tag, datatype uint16, count, value uint32) {
+		binary.LittleEndian.PutUint16(b[i:], tag)
+		binary.LittleEndian.PutUint16(b[i+2:], datatype)
+		binary.LittleEndian.PutUint32(b[i+4:], count)
+		if datatype == dtShort && lengths[datatype]*count <= 4 {
+			binary.LittleEndian.PutUint16(b[i+8:], uint16(value))
+		} else {
+			binary.LittleEndian.PutUint32(b[i+8:], value)
+		}
+		i += ifdLen
+	}
+
+	putEntry(tImageWidth, dtShort, 1, 1)
+	putEntry(tImageLength, dtShort, 1, 1)
+	putEntry(tBitsPerSample, dtShort, 1, 8)
+	putEntry(tCompression, dtShort, 1, cNone)
+	putEntry(tPhotometricInterpretation, dtShort, 1, pPaletted)
+	putEntry(tStripOffsets, dtLong, 1, pixelOffset)
+	putEntry(tRowsPerStrip, dtShort, 1, 1)
+	putEntry(tStripByteCounts, dtLong, 1, 1)
+	// Six shorts: the red, green and blue values of a two-color palette.
+	putEntry(tColorMap, dtShort, 6, colorMapOffset)
+
+	// The ColorMap holds all of the red values, then all of the green values,
+	// then all of the blue values, so the odd-numbered shorts are the three
+	// components of the second (and last) color. Make that color white; the
+	// first color stays black.
+	for j := 1; j < 6; j += 2 {
+		binary.LittleEndian.PutUint16(b[colorMapOffset+2*j:], 0xffff)
+	}
+
+	// The one pixel indexes palette entry 255, but the palette has two entries.
+	b[pixelOffset] = 0xff
+
+	if _, err := Decode(bytes.NewReader(b)); err != errInvalidColorIndex {
+		t.Fatalf("Decode with invalid palette index: got %v, want %v", err, errInvalidColorIndex)
+	}
+}
+
 // countingReaderAt wraps a byte slice and records the largest single ReadAt
 // request made of it, and the total number of bytes requested, so that a test
 // can check that a bogus length taken from a TIFF file does not lead to an
