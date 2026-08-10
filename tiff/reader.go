@@ -16,6 +16,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"math/bits"
 
 	"golang.org/x/image/ccitt"
 	"golang.org/x/image/tiff/lzw"
@@ -449,6 +450,33 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	return nil
 }
 
+// maxBytesPerPixel is the maximum possible bytes-per-pixel,
+// used for conservative bounds checking.
+const maxBytesPerPixel = 8
+
+// mul3 returns (x * y * z), unless at least one argument is negative or if the
+// computation overflows the int type. It is the equivalent of the Mul3 function
+// of the golang.org/x/image/internal/safemath package, which later versions of
+// this package use but which does not exist here.
+func mul3(x, y, z int) (_ int, ok bool) {
+	if x < 0 || y < 0 || z < 0 {
+		return -1, false
+	}
+	hi, lo := bits.Mul64(uint64(x), uint64(y))
+	if hi != 0 {
+		return -1, false
+	}
+	hi, lo = bits.Mul64(lo, uint64(z))
+	if hi != 0 {
+		return -1, false
+	}
+	a := int(lo)
+	if a < 0 || uint64(a) != lo {
+		return -1, false
+	}
+	return a, true
+}
+
 func newDecoder(r io.Reader) (*decoder, error) {
 	d := &decoder{
 		r:        newReaderAt(r),
@@ -500,6 +528,13 @@ func newDecoder(r io.Reader) (*decoder, error) {
 
 	d.config.Width = int(d.firstVal(tImageWidth))
 	d.config.Height = int(d.firstVal(tImageLength))
+
+	// Check that the image fits in memory.
+	// This conservatively assumes 8 bytes per pixel,
+	// rather than using the actual pixel size.
+	if _, ok := mul3(d.config.Width, d.config.Height, maxBytesPerPixel); !ok {
+		return nil, FormatError("image too large")
+	}
 
 	if _, ok := d.features[tBitsPerSample]; !ok {
 		// Default is 1 per specification.
@@ -648,7 +683,30 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		if blockWidth < 8 || blockHeight < 8 {
 			return nil, FormatError("tile size is too small")
 		}
-
+		// Same conservative assumption on bytes-per-pixel as for the image dimensions.
+		if _, ok := mul3(blockWidth, blockHeight, maxBytesPerPixel); !ok {
+			return nil, FormatError("tile size is too large")
+		}
+		if blockWidth-d.config.Width > 16 || blockHeight-d.config.Height > 16 {
+			// Tiles may be padded to the nearest multiple of 16, but one of
+			// the dimensions of the tile exceeds the image dimension by more
+			// than padding would require.
+			//
+			// Typical TIFF tiles are 256x256, but 1024x1024 appears to be
+			// in occasional use. If the tile is both larger than the image
+			// and has more than 1024 pixels in one dimension, it's
+			// probably malicious input.
+			//
+			// Note that this still permits very large tiles,
+			// so long as the tile is smaller than the image dimensions.
+			// A gigapixel image with a 2048x2048 tile size
+			// (used in some GIS applications)
+			// will be valid because the image dimensions are much larger
+			// than the tile size.
+			if blockWidth > 1024 || blockHeight > 1024 {
+				return nil, FormatError("tile size exceeds image size")
+			}
+		}
 		if blockWidth != 0 {
 			blocksAcross = (d.config.Width + blockWidth - 1) / blockWidth
 		}
@@ -660,11 +718,14 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		blockOffsets = d.features[tTileOffsets]
 
 	} else {
-		if int(d.firstVal(tRowsPerStrip)) != 0 {
-			blockHeight = int(d.firstVal(tRowsPerStrip))
+
+		if v := d.firstVal(tRowsPerStrip); v > 0 && v < uint(blockHeight) {
+			blockHeight = int(v)
 		}
 
 		if blockHeight != 0 {
+			// This can't overflow: We require that w*h*8 not overflow and
+			// blockHeight is no more than d.config.Height.
 			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
 		}
 
