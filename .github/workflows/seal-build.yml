@@ -1,0 +1,98 @@
+# Upstream golang.org/x/image has no GitHub Actions CI (it is developed on
+# Gerrit and tested by the Go build dashboard), so this workflow is authored
+# for the sealed build: it packages the module zip exactly as the module proxy
+# does and runs the repository's own `go test ./...` suite on every OS.
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Build the module-zip helper outside the checkout
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/create_mod.go"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" create_mod.go
+          test -x "$RUNNER_TEMP/create_mod"
+
+      - name: Stage the module source without .git and .github
+        run: |
+          set -eux
+          rm -rf "$RUNNER_TEMP/zipsrc"
+          mkdir -p "$RUNNER_TEMP/zipsrc"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . \
+            | tar -x -C "$RUNNER_TEMP/zipsrc"
+          test ! -e "$RUNNER_TEMP/zipsrc/.git"
+          test ! -e "$RUNNER_TEMP/zipsrc/.github"
+          test -f "$RUNNER_TEMP/zipsrc/go.mod"
+          test -f "$RUNNER_TEMP/zipsrc/.gitignore"
+          test -f "$RUNNER_TEMP/zipsrc/.gitattributes"
+
+      - name: Create the module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/image \
+            v0.0.0-20220302094943-723b81ca9867 \
+            "$RUNNER_TEMP/zipsrc" \
+            "$RUNNER_TEMP/out/v0.0.0-20220302094943-723b81ca9867.zip"
+          ls -l "$RUNNER_TEMP/out"
+          test "$(unzip -Z1 "$RUNNER_TEMP/out/v0.0.0-20220302094943-723b81ca9867.zip" | wc -l)" -eq 252
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20220302094943-723b81ca9867.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: go build
+        run: |
+          set -eux
+          go build ./...
+
+      - name: go test
+        run: |
+          set -eux
+          go test ./...
