@@ -1034,3 +1034,48 @@ func appendIFD(b []byte, enc byteOrder, entries map[uint16]interface{}) []byte {
 	b = appendUint32(enc, b, 0)
 	return b
 }
+
+// ioReader wraps an io.Reader to hide any io.ReaderAt implementation,
+// forcing the tiff package to use the buffer code path. It records the
+// largest read it was asked for, so that a test can check that the buffer
+// fills in bounded chunks instead of one giant allocation.
+type ioReader struct {
+	io.Reader
+	maxRead int
+}
+
+func (r *ioReader) Read(p []byte) (int, error) {
+	if len(p) > r.maxRead {
+		r.maxRead = len(p)
+	}
+	return r.Reader.Read(p)
+}
+
+// TestDecodeOOMIFDOffset tests that a TIFF with an IFD offset of 0xFFFFFFFF
+// does not cause an out-of-memory panic in buffer.fill.
+func TestDecodeOOMIFDOffset(t *testing.T) {
+	for _, endian := range []struct {
+		name   string
+		header []byte
+	}{
+		{"little-endian", []byte{'I', 'I', 42, 0, 0xff, 0xff, 0xff, 0xff}},
+		{"big-endian", []byte{'M', 'M', 0, 42, 0xff, 0xff, 0xff, 0xff}},
+	} {
+		t.Run(endian.name, func(t *testing.T) {
+			r := &ioReader{Reader: bytes.NewReader(endian.header)}
+			if _, err := Decode(r); err == nil {
+				t.Error("Decode with IFD offset 0xFFFFFFFF: got nil error, want non-nil")
+			}
+			if r.maxRead > fillChunkSize {
+				t.Errorf("Decode with IFD offset 0xFFFFFFFF: largest read was %d bytes, want at most %d", r.maxRead, fillChunkSize)
+			}
+			r = &ioReader{Reader: bytes.NewReader(endian.header)}
+			if _, err := DecodeConfig(r); err == nil {
+				t.Error("DecodeConfig with IFD offset 0xFFFFFFFF: got nil error, want non-nil")
+			}
+			if r.maxRead > fillChunkSize {
+				t.Errorf("DecodeConfig with IFD offset 0xFFFFFFFF: largest read was %d bytes, want at most %d", r.maxRead, fillChunkSize)
+			}
+		})
+	}
+}

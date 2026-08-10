@@ -12,24 +12,29 @@ type buffer struct {
 	buf []byte
 }
 
+const fillChunkSize = 10 << 20 // 10 MB
+
+// grow grows the capacity of b, if necessary, to guarantee space for another
+// n bytes, and returns the resulting slice with an unchanged length.
+// It is equivalent to slices.Grow, which is not available in this Go version.
+func grow(b []byte, n int) []byte {
+	if n -= cap(b) - len(b); n > 0 {
+		b = append(b[:cap(b)], make([]byte, n)...)[:len(b)]
+	}
+	return b
+}
+
 // fill reads data from b.r until the buffer contains at least end bytes.
 func (b *buffer) fill(end int) error {
 	m := len(b.buf)
-	if end > m {
-		if end > cap(b.buf) {
-			newcap := 1024
-			for newcap < end {
-				newcap *= 2
-			}
-			newbuf := make([]byte, end, newcap)
-			copy(newbuf, b.buf)
-			b.buf = newbuf
-		} else {
-			b.buf = b.buf[:end]
-		}
-		if n, err := io.ReadFull(b.r, b.buf[m:end]); err != nil {
-			end = m + n
-			b.buf = b.buf[:end]
+	for m < end {
+		next := minInt(end-m, fillChunkSize)
+		b.buf = grow(b.buf, next)
+		b.buf = b.buf[:m+next]
+		n, err := io.ReadFull(b.r, b.buf[m:m+next])
+		m += n
+		b.buf = b.buf[:m]
+		if err != nil {
 			return err
 		}
 	}
@@ -44,7 +49,8 @@ func (b *buffer) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	err := b.fill(end)
-	return copy(p, b.buf[o:end]), err
+	end = minInt(end, len(b.buf))
+	return copy(p, b.buf[minInt(o, end):end]), err
 }
 
 // Slice returns a slice of the underlying buffer. The slice contains
