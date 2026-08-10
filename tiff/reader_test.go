@@ -6,16 +6,20 @@ package tiff
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"io/ioutil"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	_ "image/png"
 )
@@ -413,12 +417,14 @@ func TestLargeIFDEntry(t *testing.T) {
 }
 
 // countingReaderAt wraps a byte slice and records the largest single ReadAt
-// request made of it, so that a test can check that a bogus length taken from a
-// TIFF file does not lead to an unbounded allocation before the (necessarily
-// failing) read of that data.
+// request made of it, and the total number of bytes requested, so that a test
+// can check that a bogus length taken from a TIFF file does not lead to an
+// unbounded allocation before the (necessarily failing) read of that data, and
+// that repeated reads of the same data are bounded too.
 type countingReaderAt struct {
 	r          *bytes.Reader
 	maxReadLen int
+	totalRead  int64
 }
 
 func (c *countingReaderAt) Read(p []byte) (int, error) {
@@ -429,6 +435,7 @@ func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	if len(p) > c.maxReadLen {
 		c.maxReadLen = len(p)
 	}
+	c.totalRead += int64(len(p))
 	return c.r.ReadAt(p, off)
 }
 
@@ -604,16 +611,192 @@ func TestDecodeShortIFD(t *testing.T) {
 	}
 }
 
+// TestSmallTileSize tests that a tiled image whose tiles are too small is
+// rejected. A one pixel wide, zero pixel high tile in an image that is claimed
+// to be 2^32-1 pixels wide otherwise makes Decode iterate over more than four
+// billion tiles.
+func TestSmallTileSize(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:  uint32(4294967295),
+		tImageLength: uint32(0),
+		tTileWidth:   uint32(1),
+		tTileLength:  uint32(0),
+	})
+	if _, err := Decode(bytes.NewReader(data)); err != FormatError("tile size is too small") {
+		t.Errorf("Decode of a 1x0 tile: got %v, want %v", err, FormatError("tile size is too small"))
+	}
+}
+
+// TestZeroHeightTiledImage tests that a tiled image of zero height, whose width
+// implies hundreds of millions of tiles across, still decodes to an empty image
+// and a nil error. Skipping the block loop entirely when there is no block to
+// read must not turn a zero-sized image into an error or a nil image.
+func TestZeroHeightTiledImage(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:  uint32(4294967295),
+		tImageLength: uint32(0),
+		tTileWidth:   uint32(8),
+		tTileLength:  uint32(8),
+	})
+	start := time.Now()
+	img, err := Decode(bytes.NewReader(data))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if img == nil {
+		t.Fatal("Decode returned a nil image and a nil error")
+	}
+	if got := img.Bounds().Dy(); got != 0 {
+		t.Errorf("decoded image height is %d, want 0", got)
+	}
+	// There are over half a billion tiles across, and none of them down. The
+	// block loop is skipped rather than walked over every column of an image
+	// that has no rows.
+	if elapsed > 30*time.Second {
+		t.Errorf("decoding an empty image took %v, want well under 30s", elapsed)
+	}
+}
+
+// TestExtraSamples tests that a non-RGB image claiming more than one sample per
+// pixel is rejected, instead of being decoded as if it had a single one.
+func TestExtraSamples(t *testing.T) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(8),
+		tImageLength:               uint32(8),
+		tBitsPerSample:             []uint16{8, 8, 8},
+		tPhotometricInterpretation: uint16(pBlackIsZero),
+	})
+	if _, err := DecodeConfig(bytes.NewReader(data)); err != UnsupportedError("extra samples") {
+		t.Errorf("DecodeConfig of a grayscale image with three samples per pixel: got %v, want %v", err, UnsupportedError("extra samples"))
+	}
+}
+
+// TestOversizedTileData tests that the decompressed data of a tile is limited
+// to the size the tile can hold, so that a small image built out of many tiles
+// that all point at the same compressed data cannot be made to decompress an
+// unbounded amount of it. The image below is 256x256 pixels and a little over
+// 64 KiB long, but each of its 1024 tiles decompresses to 64 MiB, or 64 GiB in
+// total, if the tile size is not taken into account.
+func TestOversizedTileData(t *testing.T) {
+	const (
+		imageWidth  = 256
+		imageHeight = 256
+		tileWidth   = 8
+		tileLength  = 8
+		numTiles    = (imageWidth * imageHeight) / (tileWidth * tileLength)
+	)
+
+	// Create a chunk of tile data that decompresses to a large size.
+	var zbuf bytes.Buffer
+	zw := zlib.NewWriter(&zbuf)
+	zeros := make([]byte, 1024)
+	for i := 0; i < 1<<16; i++ {
+		if _, err := zw.Write(zeros); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zdata := zbuf.Bytes()
+
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+
+	zoff := len(data)
+	data = append(data, zdata...)
+
+	// Each tile refers to the same compressed data chunk.
+	var tileoffs []uint32
+	var tilesizes []uint32
+	for i := 0; i < numTiles; i++ {
+		tileoffs = append(tileoffs, uint32(zoff))
+		tilesizes = append(tilesizes, uint32(len(zdata)))
+	}
+
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(imageWidth),
+		tImageLength:               uint32(imageHeight),
+		tTileWidth:                 uint32(tileWidth),
+		tTileLength:                uint32(tileLength),
+		tTileOffsets:               tileoffs,
+		tTileByteCounts:            tilesizes,
+		tCompression:               uint16(cDeflate),
+		tBitsPerSample:             []uint16{16, 16, 16},
+		tPhotometricInterpretation: uint16(pRGB),
+	})
+
+	// The reader deliberately implements io.ReaderAt, so that the tile data is
+	// read through it instead of being sliced out of a *buffer.
+	c := &countingReaderAt{r: bytes.NewReader(data)}
+	start := time.Now()
+	img, err := Decode(c)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got, want := img.Bounds(), image.Rect(0, 0, imageWidth, imageHeight); got != want {
+		t.Errorf("decoded image bounds are %v, want %v", got, want)
+	}
+
+	// Each tile stops reading once it holds as much data as its 8x8 pixels can
+	// use, so only the leading fraction of each compressed chunk is ever
+	// inflated. Without the limit this inflates 64 GiB and takes tens of
+	// seconds, reading all 64 MiB of compressed data on the way.
+	if elapsed > 30*time.Second {
+		t.Errorf("decoding took %v, want well under 30s", elapsed)
+	}
+	if maxRead := int64(numTiles) * int64(len(zdata)) / 4; c.totalRead >= maxRead {
+		t.Errorf("decoding read %d bytes of compressed data, want well under %d", c.totalRead, maxRead)
+	}
+}
+
+// TestReadBuf tests that readBuf reads no more than the given limit, so that a
+// small tile cannot be made to yield an unbounded amount of decompressed data,
+// and that it reuses the buffer it is given.
+func TestReadBuf(t *testing.T) {
+	const lim = 10
+	src := bytes.Repeat([]byte{'x'}, 4*lim)
+
+	buf, err := readBuf(bytes.NewReader(src), nil, lim)
+	if err != nil {
+		t.Fatalf("readBuf: %v", err)
+	}
+	if len(buf) != lim {
+		t.Fatalf("readBuf of a %d byte input with a limit of %d: got %d bytes", len(src), lim, len(buf))
+	}
+
+	// An input shorter than the limit is read in full.
+	buf2, err := readBuf(bytes.NewReader(src[:lim/2]), buf, lim)
+	if err != nil {
+		t.Fatalf("readBuf: %v", err)
+	}
+	if len(buf2) != lim/2 {
+		t.Fatalf("readBuf of a %d byte input with a limit of %d: got %d bytes", lim/2, lim, len(buf2))
+	}
+}
+
 // benchmarkDecode benchmarks the decoding of an image.
 func benchmarkDecode(b *testing.B, filename string) {
 	b.Helper()
-	b.StopTimer()
 	contents, err := ioutil.ReadFile(testdataDir + filename)
 	if err != nil {
 		b.Fatal(err)
 	}
-	r := &buffer{buf: contents}
-	b.StartTimer()
+	benchmarkDecodeData(b, contents)
+}
+
+func benchmarkDecodeData(b *testing.B, data []byte) {
+	b.Helper()
+	r := &buffer{buf: data}
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, err := Decode(r)
 		if err != nil {
@@ -624,3 +807,163 @@ func benchmarkDecode(b *testing.B, filename string) {
 
 func BenchmarkDecodeCompressed(b *testing.B)   { benchmarkDecode(b, "video-001.tiff") }
 func BenchmarkDecodeUncompressed(b *testing.B) { benchmarkDecode(b, "video-001-uncompressed.tiff") }
+
+func BenchmarkZeroHeightTile(b *testing.B) {
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:  uint32(4294967295),
+		tImageLength: uint32(0),
+		tTileWidth:   uint32(1),
+		tTileLength:  uint32(0),
+	})
+	benchmarkDecodeData(b, data)
+}
+
+func BenchmarkRepeatedOversizedTileData(b *testing.B) {
+	const (
+		imageWidth  = 256
+		imageHeight = 256
+		tileWidth   = 8
+		tileLength  = 8
+		numTiles    = (imageWidth * imageHeight) / (tileWidth * tileLength)
+	)
+
+	// Create a chunk of tile data that decompresses to a large size.
+	zdata := func() []byte {
+		var zbuf bytes.Buffer
+		zw := zlib.NewWriter(&zbuf)
+		zeros := make([]byte, 1024)
+		for i := 0; i < 1<<16; i++ {
+			zw.Write(zeros)
+		}
+		zw.Close()
+		return zbuf.Bytes()
+	}()
+
+	enc := binary.BigEndian
+	data := newTIFF(enc)
+
+	zoff := len(data)
+	data = append(data, zdata...)
+
+	// Each tile refers to the same compressed data chunk.
+	var tileoffs []uint32
+	var tilesizes []uint32
+	for i := 0; i < numTiles; i++ {
+		tileoffs = append(tileoffs, uint32(zoff))
+		tilesizes = append(tilesizes, uint32(len(zdata)))
+	}
+
+	data = appendIFD(data, enc, map[uint16]interface{}{
+		tImageWidth:                uint32(imageWidth),
+		tImageLength:               uint32(imageHeight),
+		tTileWidth:                 uint32(tileWidth),
+		tTileLength:                uint32(tileLength),
+		tTileOffsets:               tileoffs,
+		tTileByteCounts:            tilesizes,
+		tCompression:               uint16(cDeflate),
+		tBitsPerSample:             []uint16{16, 16, 16},
+		tPhotometricInterpretation: uint16(pRGB),
+	})
+	benchmarkDecodeData(b, data)
+}
+
+type byteOrder interface {
+	binary.ByteOrder
+}
+
+// appendUint16 appends v to b in enc's byte order. binary.AppendByteOrder and
+// its AppendUintNN methods are not available in the Go version this package
+// targets, so the encoding is done with a scratch buffer instead.
+func appendUint16(enc byteOrder, b []byte, v uint16) []byte {
+	var buf [2]byte
+	enc.PutUint16(buf[:], v)
+	return append(b, buf[:]...)
+}
+
+// appendUint32 appends v to b in enc's byte order.
+func appendUint32(enc byteOrder, b []byte, v uint32) []byte {
+	var buf [4]byte
+	enc.PutUint32(buf[:], v)
+	return append(b, buf[:]...)
+}
+
+// newTIFF returns the TIFF header.
+func newTIFF(enc byteOrder) []byte {
+	b := []byte{0, 0, 0, 42, 0, 0, 0, 0}
+	switch enc.Uint16([]byte{1, 0}) {
+	case 0x1:
+		b[0], b[1] = 'I', 'I'
+	case 0x100:
+		b[0], b[1] = 'M', 'M'
+	default:
+		panic("odd byte order")
+	}
+	return b
+}
+
+// appendIFD appends an IFD to the TIFF in b,
+// updating the IFD location in the header.
+func appendIFD(b []byte, enc byteOrder, entries map[uint16]interface{}) []byte {
+	var tags []uint16
+	for tag := range entries {
+		tags = append(tags, tag)
+	}
+	sort.Slice(tags, func(i, j int) bool {
+		return tags[i] < tags[j]
+	})
+
+	var ifd []byte
+	for _, tag := range tags {
+		ifd = appendUint16(enc, ifd, tag)
+		switch v := entries[tag].(type) {
+		case uint16:
+			ifd = appendUint16(enc, ifd, dtShort)
+			ifd = appendUint32(enc, ifd, 1)
+			ifd = appendUint16(enc, ifd, v)
+			ifd = appendUint16(enc, ifd, v)
+		case uint32:
+			ifd = appendUint16(enc, ifd, dtLong)
+			ifd = appendUint32(enc, ifd, 1)
+			ifd = appendUint32(enc, ifd, v)
+		case []uint16:
+			ifd = appendUint16(enc, ifd, dtShort)
+			ifd = appendUint32(enc, ifd, uint32(len(v)))
+			switch len(v) {
+			case 0:
+				ifd = appendUint32(enc, ifd, 0)
+			case 1:
+				ifd = appendUint16(enc, ifd, v[0])
+				ifd = appendUint16(enc, ifd, v[1])
+			default:
+				ifd = appendUint32(enc, ifd, uint32(len(b)))
+				for _, e := range v {
+					b = appendUint16(enc, b, e)
+				}
+			}
+		case []uint32:
+			ifd = appendUint16(enc, ifd, dtLong)
+			ifd = appendUint32(enc, ifd, uint32(len(v)))
+			switch len(v) {
+			case 0:
+				ifd = appendUint32(enc, ifd, 0)
+			case 1:
+				ifd = appendUint32(enc, ifd, v[0])
+			default:
+				ifd = appendUint32(enc, ifd, uint32(len(b)))
+				for _, e := range v {
+					b = appendUint32(enc, b, e)
+				}
+			}
+		default:
+			panic(fmt.Errorf("unhandled type %T", v))
+		}
+	}
+
+	enc.PutUint32(b[4:8], uint32(len(b)))
+	b = appendUint16(enc, b, uint16(len(entries)))
+	b = append(b, ifd...)
+	b = appendUint32(enc, b, 0)
+	return b
+}
